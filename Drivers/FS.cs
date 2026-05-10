@@ -201,6 +201,65 @@ namespace BAZOS.FS
             return lba;
         }
 
+        private static uint ComputeNextFreeLba()
+        {
+            if (!_mounted)
+                return 2;
+
+            uint max = 1;
+            var visitedDirs = new HashSet<uint>();
+
+            void ScanDir(uint startLba)
+            {
+                if (startLba == 0)
+                    return;
+
+                if (!visitedDirs.Add(startLba))
+                    return;
+
+                VisitDirChain(startLba, (sectorLba, buffer) =>
+                {
+                    if (sectorLba > max)
+                        max = sectorLba;
+
+                    uint next = ReadNextDirLba(buffer);
+                    if (next > max)
+                        max = next;
+
+                    int entryBase = DirHeaderSize;
+                    for (int i = 0; i < EntriesPerSector; i++)
+                    {
+                        int offset = entryBase + i * EntrySize;
+                        if (offset + EntrySize > 512)
+                            break;
+
+                        var e = ReadDirEntry(buffer, offset);
+                        if (e == null || string.IsNullOrEmpty(e.Value.Name))
+                            continue;
+
+                        uint lba = e.Value.FirstBlockLba;
+                        if (lba > max)
+                            max = lba;
+
+                        if (e.Value.Flags == 1)
+                            ScanDir(lba);
+                    }
+
+                    return true;
+                });
+            }
+
+            ScanDir(_superblock.RootDirLba);
+
+            if (max < 1)
+                max = 1;
+
+            uint nextFree = max + 1;
+            if (nextFree < 2)
+                nextFree = 2;
+            return nextFree;
+        }
+
         public static bool Format()
         {
             Span<byte> buffer = stackalloc byte[512];
@@ -274,6 +333,7 @@ namespace BAZOS.FS
             _dirStack[0] = rootLba;
             _currentDirLba = rootLba;
             _nextFreeLba = 2;
+            _nextFreeLba = ComputeNextFreeLba();
 
             Console.WriteLine("BazFs.Mount: OK");
             Console.WriteLine($"  RootDirLba = {rootLba}");
@@ -474,6 +534,154 @@ namespace BAZOS.FS
             return found;
         }
 
+        private static bool IsDirectoryEmpty(uint startLba)
+        {
+            bool any = false;
+
+            VisitDirChain(startLba, (sector, buf) =>
+            {
+                int entryBase = DirHeaderSize;
+                for (int i = 0; i < EntriesPerSector; i++)
+                {
+                    int offset = entryBase + i * EntrySize;
+                    if (offset + EntrySize > 512)
+                        break;
+
+                    var e = ReadDirEntry(buf, offset);
+                    if (e == null || string.IsNullOrEmpty(e.Value.Name))
+                        continue;
+
+                    any = true;
+                    return false;
+                }
+                return true;
+            });
+
+            return !any;
+        }
+
+        private static void ZeroDirectoryChain(uint startLba)
+        {
+            VisitDirChain(startLba, (sectorLba, buf) =>
+            {
+                Span<byte> zero = stackalloc byte[512];
+                zero.Clear();
+                AtaDisk.WriteSector(sectorLba, zero);
+                return true;
+            });
+        }
+
+        public static bool FsckLite()
+        {
+            if (!_mounted)
+            {
+                Console.WriteLine("fsck: FS is not mounted.");
+                return false;
+            }
+
+            int errors = 0;
+            var visitedDirs = new HashSet<uint>();
+
+            void ScanDir(uint startLba, int depth)
+            {
+                if (startLba == 0)
+                {
+                    errors++;
+                    Console.WriteLine("fsck: directory start LBA is 0");
+                    return;
+                }
+
+                if (!visitedDirs.Add(startLba))
+                    return;
+
+                // protect from insane recursion in corrupted FS
+                if (depth > 64)
+                {
+                    errors++;
+                    Console.WriteLine("fsck: directory recursion limit hit");
+                    return;
+                }
+
+                var chainVisited = new HashSet<uint>();
+                VisitDirChain(startLba, (sectorLba, buf) =>
+                {
+                    if (!chainVisited.Add(sectorLba))
+                    {
+                        errors++;
+                        Console.WriteLine($"fsck: dir chain cycle at LBA={sectorLba}");
+                        return false;
+                    }
+
+                    var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    int entryBase = DirHeaderSize;
+                    for (int i = 0; i < EntriesPerSector; i++)
+                    {
+                        int offset = entryBase + i * EntrySize;
+                        if (offset + EntrySize > 512)
+                            break;
+
+                        var e = ReadDirEntry(buf, offset);
+                        if (e == null || string.IsNullOrEmpty(e.Value.Name))
+                            continue;
+
+                        if (e.Value.Flags != 0 && e.Value.Flags != 1)
+                        {
+                            errors++;
+                            Console.WriteLine($"fsck: invalid flags={e.Value.Flags} for \"{e.Value.Name}\"");
+                        }
+
+                        if (!names.Add(e.Value.Name))
+                        {
+                            errors++;
+                            Console.WriteLine($"fsck: duplicate name \"{e.Value.Name}\" in directory LBA={startLba}");
+                        }
+
+                        if (e.Value.FirstBlockLba == 0)
+                        {
+                            errors++;
+                            Console.WriteLine($"fsck: entry \"{e.Value.Name}\" has FirstBlockLba=0");
+                        }
+
+                        if (e.Value.Flags == 1)
+                            ScanDir(e.Value.FirstBlockLba, depth + 1);
+                    }
+
+                    return true;
+                });
+            }
+
+            if (_superblock.Magic != BazSuperblock.ExpectedMagic)
+            {
+                errors++;
+                Console.WriteLine($"fsck: bad magic 0x{_superblock.Magic:X8}");
+            }
+
+            if (_superblock.Version != BazSuperblock.CurrentVersion)
+            {
+                errors++;
+                Console.WriteLine($"fsck: unsupported version {_superblock.Version}");
+            }
+
+            if (_superblock.RootDirLba == 0)
+            {
+                errors++;
+                Console.WriteLine("fsck: RootDirLba is 0");
+            }
+            else
+            {
+                ScanDir(_superblock.RootDirLba, 0);
+            }
+
+            if (errors == 0)
+            {
+                Console.WriteLine("fsck: OK");
+                return true;
+            }
+
+            Console.WriteLine($"fsck: errors={errors}");
+            return false;
+        }
+
         public static bool ExistsInCurrentDir(string name, out BazDirEntry entry)
         {
             return ExistsInDir(_currentDirLba, name, out entry);
@@ -509,6 +717,9 @@ namespace BAZOS.FS
                 return false;
 
             uint cur = absolute ? _superblock.RootDirLba : _currentDirLba;
+            var stack = new uint[32];
+            int top = 0;
+            stack[top] = cur;
 
             // все кроме последнего – каталоги
             for (int i = 0; i < segments.Length - 1; i++)
@@ -518,8 +729,17 @@ namespace BAZOS.FS
                     continue;
                 if (seg == "..")
                 {
-                    Console.WriteLine("BazFs.ResolvePath: '..' внутри сложного пути пока не поддерживается.");
-                    return false;
+                    if (top > 0)
+                    {
+                        top--;
+                        cur = stack[top];
+                    }
+                    else
+                    {
+                        // already at root/current base
+                        cur = stack[0];
+                    }
+                    continue;
                 }
 
                 if (!FindSubdirectory(cur, seg, out var childLba))
@@ -529,6 +749,11 @@ namespace BAZOS.FS
                 }
 
                 cur = childLba;
+                if (top + 1 < stack.Length)
+                {
+                    top++;
+                    stack[top] = cur;
+                }
             }
 
             string last = segments[segments.Length - 1];
@@ -840,6 +1065,99 @@ namespace BAZOS.FS
             Console.WriteLine(new string(content));
         }
 
+        public static bool TryReadFileBytes(string path, out byte[] data)
+        {
+            data = Array.Empty<byte>();
+
+            if (!_mounted)
+            {
+                Console.WriteLine("BazFs.TryReadFileBytes: FS is not mounted.");
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                Console.WriteLine("BazFs.TryReadFileBytes: invalid path.");
+                return false;
+            }
+
+            if (!ResolvePath(path, wantDirectory: false, out var res))
+            {
+                Console.WriteLine("BazFs.TryReadFileBytes: invalid path.");
+                return false;
+            }
+
+            if (res.Kind != BazPathKind.File)
+                return false;
+
+            var entry = res.Entry;
+
+            Span<byte> fileBuf = stackalloc byte[512];
+            if (!AtaDisk.ReadSector(entry.FirstBlockLba, fileBuf))
+            {
+                Console.WriteLine("BazFs.TryReadFileBytes: failed to read file sector.");
+                return false;
+            }
+
+            int len = (int)Math.Min((uint)512, entry.Size);
+            data = new byte[len];
+            for (int i = 0; i < len; i++)
+                data[i] = fileBuf[i];
+
+            return true;
+        }
+
+        public static bool TryListDirectory(string path, out BazDirEntry[] entries)
+        {
+            entries = Array.Empty<BazDirEntry>();
+
+            if (!_mounted)
+                return false;
+
+            if (string.IsNullOrWhiteSpace(path))
+                return false;
+
+            uint dirLba;
+
+            path = path.Replace('\\', '/');
+            if (path == "/")
+            {
+                dirLba = _superblock.RootDirLba;
+            }
+            else
+            {
+                if (!ResolvePath(path, wantDirectory: true, out var res))
+                    return false;
+
+                if (res.Kind != BazPathKind.Directory)
+                    return false;
+
+                dirLba = res.Entry.FirstBlockLba;
+            }
+
+            var list = new System.Collections.Generic.List<BazDirEntry>();
+            VisitDirChain(dirLba, (sector, buf) =>
+            {
+                int entryBase = DirHeaderSize;
+                for (int i = 0; i < EntriesPerSector; i++)
+                {
+                    int offset = entryBase + i * EntrySize;
+                    if (offset + EntrySize > 512)
+                        break;
+
+                    var e = ReadDirEntry(buf, offset);
+                    if (e == null || string.IsNullOrEmpty(e.Value.Name))
+                        continue;
+
+                    list.Add(e.Value);
+                }
+                return true;
+            });
+
+            entries = list.ToArray();
+            return true;
+        }
+
         public static void CreateDirectory(string path)
         {
             if (!_mounted)
@@ -876,8 +1194,22 @@ namespace BAZOS.FS
 
                 if (seg == "..")
                 {
-                    Console.WriteLine("BazFs.CreateDirectory: '..' not supported in mkdir path.");
-                    return;
+                    // best-effort: allow going up only when starting from current dir stack
+                    if (!absolute && _dirStackTop > 0)
+                    {
+                        curDir = _dirStack[0];
+                        int top = _dirStackTop;
+                        if (top > 0)
+                        {
+                            top--;
+                            curDir = _dirStack[top];
+                        }
+                    }
+                    else
+                    {
+                        curDir = _superblock.RootDirLba;
+                    }
+                    continue;
                 }
 
                 // есть ли уже такой подкаталог
@@ -974,7 +1306,7 @@ namespace BAZOS.FS
             return found;
         }
 
-        public static void RemoveDirectory(string name)
+        public static void RemoveDirectory(string name, bool force = false)
         {
             if (!_mounted)
             {
@@ -987,7 +1319,9 @@ namespace BAZOS.FS
                 Console.WriteLine("BazFs.RemoveDirectory: invalid name.");
                 return;
             }
+            name = name.Trim();
 
+            bool found = false;
             bool removed = false;
 
             VisitDirChain(_currentDirLba, (sectorLba, dirBuf) =>
@@ -1007,9 +1341,18 @@ namespace BAZOS.FS
                     if (!string.Equals(e.Value.Name, name, StringComparison.OrdinalIgnoreCase))
                         continue;
 
+                    found = true;
+
                     if (e.Value.Flags != 1)
                     {
                         Console.WriteLine("BazFs.RemoveDirectory: not a directory.");
+                        removed = false;
+                        return false;
+                    }
+
+                    if (!force && !IsDirectoryEmpty(e.Value.FirstBlockLba))
+                    {
+                        Console.WriteLine("BazFs.RemoveDirectory: directory not empty (use rmdir /f to discard).");
                         removed = false;
                         return false;
                     }
@@ -1024,11 +1367,12 @@ namespace BAZOS.FS
                         return false;
                     }
 
-                    Span<byte> zero = stackalloc byte[512];
-                    zero.Clear();
-                    AtaDisk.WriteSector(e.Value.FirstBlockLba, zero);
+                    if (force)
+                        ZeroDirectoryChain(e.Value.FirstBlockLba);
 
-                    Console.WriteLine($"BazFs.RemoveDirectory: \"{name}\" removed (contents discarded).");
+                    Console.WriteLine(force
+                        ? $"BazFs.RemoveDirectory: \"{name}\" removed (contents discarded)."
+                        : $"BazFs.RemoveDirectory: \"{name}\" removed.");
                     removed = true;
                     return false;
                 }
@@ -1038,7 +1382,8 @@ namespace BAZOS.FS
 
             if (!removed)
             {
-                Console.WriteLine($"BazFs.RemoveDirectory: directory \"{name}\" not found.");
+                if (!found)
+                    Console.WriteLine($"BazFs.RemoveDirectory: directory \"{name}\" not found.");
             }
         }
 

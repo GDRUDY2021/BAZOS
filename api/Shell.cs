@@ -1,16 +1,112 @@
+using BAZOS.Drivers;
 using BAZOS.FS;
+using Cosmos.Kernel.Core.X64.Power;
+using Cosmos.Kernel.System;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using static System.Net.WebRequestMethods;
-using Cosmos.Kernel.System;
-using Cosmos.Kernel.Core.X64.Power;
+using BAZOS.Api.Commands;
+using System.Text;
+using BAZOS.Drivers;
 
 namespace BAZOS.Api
 {
     public static class Shell
     {
+        private sealed class KernelPanicException : Exception
+        {
+            public KernelPanicException(string message) : base(message) { }
+        }
+
+        public interface ICommand
+        {
+            string Name { get; }
+            string[] Aliases { get; }
+            string? Help { get; }
+            void Execute(CommandContext ctx);
+        }
+
+        public sealed class CommandRegistry
+        {
+            private readonly Dictionary<string, ICommand> _byName = new(StringComparer.OrdinalIgnoreCase);
+
+            public void Clear() => _byName.Clear();
+
+            public void Register(ICommand command)
+            {
+                if (command == null)
+                    return;
+
+                RegisterName(command.Name, command);
+
+                var aliases = command.Aliases ?? Array.Empty<string>();
+                for (int i = 0; i < aliases.Length; i++)
+                    RegisterName(aliases[i], command);
+            }
+
+            private void RegisterName(string name, ICommand command)
+            {
+                if (string.IsNullOrWhiteSpace(name))
+                    return;
+
+                _byName[name.Trim()] = command;
+            }
+
+            public bool TryGet(string name, out ICommand command)
+                => _byName.TryGetValue(name, out command);
+
+            public bool Disable(string nameOrAlias)
+            {
+                if (string.IsNullOrWhiteSpace(nameOrAlias))
+                    return false;
+
+                if (!_byName.TryGetValue(nameOrAlias.Trim(), out var cmd))
+                    return false;
+
+                var keys = new List<string>();
+                foreach (var kv in _byName)
+                {
+                    if (ReferenceEquals(kv.Value, cmd))
+                        keys.Add(kv.Key);
+                }
+
+                for (int i = 0; i < keys.Count; i++)
+                    _byName.Remove(keys[i]);
+
+                return true;
+            }
+
+            public IEnumerable<ICommand> AllUnique()
+            {
+                var seen = new HashSet<ICommand>();
+                foreach (var kv in _byName)
+                {
+                    if (seen.Add(kv.Value))
+                        yield return kv.Value;
+                }
+            }
+        }
+
+        private sealed class DelegateCommand : ICommand
+        {
+            private readonly Action<CommandContext> _action;
+
+            public string Name { get; }
+            public string[] Aliases { get; }
+            public string? Help { get; }
+
+            public DelegateCommand(string name, Action<CommandContext> action, string? help = null, params string[] aliases)
+            {
+                Name = name;
+                _action = action;
+                Help = help;
+                Aliases = aliases ?? Array.Empty<string>();
+            }
+
+            public void Execute(CommandContext ctx) => _action(ctx);
+        }
 
         public readonly struct CommandContext
         {
@@ -32,11 +128,34 @@ namespace BAZOS.Api
                 => Options.TryGetValue(name, out var v) ? v : null;
         }
 
-        private static readonly Dictionary<string, Action<CommandContext>> Commands = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly CommandRegistry Commands = new();
         private static readonly X64PowerOps p = new X64PowerOps();
+        private static readonly DriverManager DriverManager = new DriverManager();
 
         public static void Init()
         {
+            DeviceManager.RegisterDevice(new DeviceDescriptor
+            {
+                Id = "mouse0",
+                Type = DeviceType.Mouse,
+                Name = "Virtual Mouse",
+                Enabled = true
+            });
+            DeviceManager.RegisterDevice(new DeviceDescriptor
+            {
+                Id = "kbd0",
+                Type = DeviceType.Keyboard,
+                Name = "Keyboard",
+                Enabled = true
+            });
+            DeviceManager.RegisterDevice(new DeviceDescriptor
+            {
+                Id = "audio0",
+                Type = DeviceType.Audio,
+                Name = "Audio",
+                Enabled = true
+            });
+
             RegisterCommands();
         }
 
@@ -91,15 +210,17 @@ namespace BAZOS.Api
                 }
             }
 
-            if (Commands.TryGetValue(cmd, out var action))
+            if (Commands.TryGet(cmd, out var command))
             {
                 try
                 {
                     var ctx = new CommandContext(cmd, args.ToArray(), options);
-                    action(ctx);
+                    command.Execute(ctx);
                 }
                 catch (Exception ex)
                 {
+                    if (ex is KernelPanicException)
+                        throw;
                     Console.WriteLine($"Error: {ex.Message}");
                 }
             }
@@ -113,27 +234,33 @@ namespace BAZOS.Api
         {
             Commands.Clear();
 
-            Commands["help"] = Help;
-            Commands["cls"] = _ => Console.Clear();
-            Commands["clear"] = _ => Console.Clear();
-            Commands["halt"] = Halt;
+            Commands.Register(new DelegateCommand("help", Help, "Show help"));
+            Commands.Register(new DelegateCommand("cls", _ => Console.Clear(), "Clear screen", aliases: new[] { "clear" }));
+            Commands.Register(new DelegateCommand("halt", Halt, "Halt the system"));
 
-            Commands["dir"] = ListDirectory;
-            Commands["cd"] = ChangeDirectory;
-            Commands["mkdir"] = CreateDirectory;
-            Commands["rmdir"] = RemoveDirectory;
-            Commands["del"] = DeleteFile;
-            Commands["copy"] = CopyFile;
-            Commands["type"] = TypeFile;
-            Commands["panic-ex"] = _ => ThrowTestException(); //test
-            Commands["mkfs"] = Mkfs;
-            Commands["mount"] = MountFs;
-            Commands["dumpfs"] = DumpFs;
-            Commands["dirfs"] = DirFs;
-            Commands["mkfile"] = MkFile;
-            Commands["catfs"] = CatFs; //удалить потом
-            Commands["check"] = CheckEntry;
-            Commands["power"] = Power;
+            Commands.Register(new DelegateCommand("dir", ListDirectory, "List current directory"));
+            Commands.Register(new DelegateCommand("cd", ChangeDirectory, "Change directory"));
+            Commands.Register(new DelegateCommand("mkdir", CreateDirectory, "Create directory"));
+            Commands.Register(new DelegateCommand("rmdir", RemoveDirectory, "Remove directory"));
+            Commands.Register(new DelegateCommand("del", DeleteFile, "Delete file"));
+            Commands.Register(new DelegateCommand("copy", CopyFile, "Copy file"));
+            Commands.Register(new DelegateCommand("type", TypeFile, "Print file contents"));
+
+            Commands.Register(new DelegateCommand("panic", _ => Panic(), "Kernel panic (crash)"));
+
+            Commands.Register(new DelegateCommand("mkfs", Mkfs, "Format BAZFS"));
+            Commands.Register(new DelegateCommand("mount", MountFs, "Mount BAZFS"));
+            Commands.Register(new DelegateCommand("dumpfs", DumpFs, "Dump raw FS sector"));
+            Commands.Register(new DelegateCommand("fsck", _ => BazFs.FsckLite(), "Check BAZFS (fsck-lite)"));
+            Commands.Register(new DelegateCommand("dirfs", DirFs, "List BAZFS root"));
+            Commands.Register(new DelegateCommand("mkfile", MkFile, "Create file with data"));
+            Commands.Register(new DelegateCommand("catfs", CatFs, "Read file (legacy)"));
+            Commands.Register(new DelegateCommand("check", CheckEntry, "Check file/dir exists"));
+
+            Commands.Register(new DelegateCommand("power", Power, "Power control"));
+
+            Commands.Register(new DeviceCommand());
+            Commands.Register(new DriverCommand(DriverManager));
         }
 
         private static void DumpFs(CommandContext ctx)
@@ -144,7 +271,7 @@ namespace BAZOS.Api
             if (AtaDisk.ReadSector(0, buffer))
             {
                 Console.WriteLine("Sector 0 read OK. First bytes:");
-                for (int i = 0; i < 2048; i++)
+                for (int i = 0; i < 512; i++)
                     Console.Write($"{buffer[i]:X2} ");
                 Console.WriteLine();
             }
@@ -242,6 +369,12 @@ namespace BAZOS.Api
 
         private static void ThrowTestException()
         {
+            throw new KernelPanicException("Test exception (panic-ex)");
+        }
+
+        private static void Panic()
+        {
+            throw new KernelPanicException("Kernel panic requested");
         }
 
         public static event Action? HaltRequested;
@@ -249,17 +382,15 @@ namespace BAZOS.Api
         private static void Help(CommandContext ctx)
         {
             Console.WriteLine("Available commands:");
-            Console.WriteLine("  help             - Show this help");
-            Console.WriteLine("  cls/clear        - Clear screen");
-            Console.WriteLine("  halt             - Halt the system");
-            Console.WriteLine("  dir              - List current directory");
-            Console.WriteLine("  cd <path>        - Change directory");
-            Console.WriteLine("  mkdir <path>     - Create directory");
-            Console.WriteLine("  rmdir <path>     - Remove empty directory");
-            Console.WriteLine("  del <file>       - Delete file");
-            Console.WriteLine("  copy <src> <dst> - Copy file");
-            Console.WriteLine("  type <file>      - Show file contents");
-            Console.WriteLine("  options syntax:  /name or /name=value");
+            foreach (var c in Commands.AllUnique().OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                string aliases = (c.Aliases != null && c.Aliases.Length > 0)
+                    ? $" (aliases: {string.Join(", ", c.Aliases)})"
+                    : string.Empty;
+                string help = string.IsNullOrWhiteSpace(c.Help) ? string.Empty : $" - {c.Help}";
+                Console.WriteLine($"  {c.Name}{aliases}{help}");
+            }
+            Console.WriteLine("options syntax: /name or /name=value");
         }
 
         private static void Halt(CommandContext ctx)
@@ -288,6 +419,12 @@ namespace BAZOS.Api
                 Console.WriteLine($"  Version = {sb.Version}");
                 Console.WriteLine($"  RootLBA = {sb.RootDirLba}");
                 Console.WriteLine($"  Blocks  = {sb.TotalBlocks}");
+
+                DeviceManager.LoadConfig();
+                ModuleLoader.Apply(Commands);
+
+                DriverManager.Reload();
+                DriverManager.ApplyEnabled();
             }
             else
             {
@@ -329,11 +466,12 @@ namespace BAZOS.Api
             var args = ctx.Args;
             if (args.Length == 0)
             {
-                Console.WriteLine("Usage: rmdir <name>");
+                Console.WriteLine("Usage: rmdir <name> [/f]");
                 return;
             }
 
-            BazFs.RemoveDirectory(args[0]);
+            bool force = ctx.HasOption("f");
+            BazFs.RemoveDirectory(args[0], force);
         }
 
         private static void DeleteFile(CommandContext ctx)
