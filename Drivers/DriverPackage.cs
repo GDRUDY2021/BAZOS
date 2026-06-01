@@ -25,6 +25,7 @@ namespace BAZOS.Drivers
         public string DriverType => GetManifest("type") ?? "unknown";
         public string Runtime => GetManifest("runtime") ?? "none";
         public string EntryInit => GetManifest("entry_init") ?? "Init";
+        public string PayloadFormat => GetManifest("payload_format") ?? "bvx-v1";
 
         public bool IsRequired
         {

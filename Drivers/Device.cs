@@ -66,19 +66,13 @@ namespace BAZOS.Drivers
 
             var text = BuildConfigText();
             var bytes = Encoding.ASCII.GetBytes(text);
-            if (bytes.Length > 512)
-            {
-                Console.WriteLine("DeviceManager.SaveConfig: devices.cfg too large (>512 bytes).");
-                return;
-            }
-
             BazFs.CreateFileWithPath(ConfigPath, bytes, overwrite: true);
         }
 
         private static string BuildConfigText()
         {
             var sb = new StringBuilder();
-            sb.AppendLine("# BAZOS devices.cfg (max 512 bytes)");
+            sb.AppendLine("# BAZOS devices.cfg");
 
             foreach (var d in _devices)
             {

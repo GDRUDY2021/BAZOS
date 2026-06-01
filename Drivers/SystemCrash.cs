@@ -10,6 +10,7 @@ namespace BAZOS.Drivers
             try
             {
                 Console.Clear();
+                Console.WriteLine();
                 Console.WriteLine("==================================================");
                 Console.WriteLine("              CRITICAL SYSTEM FAILURE             ");
                 Console.WriteLine("==================================================");

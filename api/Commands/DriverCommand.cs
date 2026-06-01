@@ -135,6 +135,57 @@ namespace BAZOS.Api.Commands
                 return;
             }
 
+            if (Eq(sub, "cache"))
+            {
+                if (args.Length < 2)
+                {
+                    Console.WriteLine("Usage: driver cache status|clear");
+                    return;
+                }
+
+                if (Eq(args[1], "status"))
+                {
+                    Console.WriteLine($"CacheEntries: {_manager.CacheEntries}");
+                    Console.WriteLine($"CacheHits: {_manager.CacheHits}");
+                    Console.WriteLine($"CacheMisses: {_manager.CacheMisses}");
+                    return;
+                }
+
+                if (Eq(args[1], "clear"))
+                {
+                    _manager.ClearCache();
+                    Console.WriteLine("OK");
+                    return;
+                }
+
+                Console.WriteLine("Usage: driver cache status|clear");
+                return;
+            }
+
+            if (Eq(sub, "mem"))
+            {
+                if (args.Length < 2 || Eq(args[1], "status"))
+                {
+                    var st = MemoryManager.GetStats();
+                    Console.WriteLine($"CapacityBytes: {st.CapacityBytes}");
+                    Console.WriteLine($"UsedBytes: {st.UsedBytes}");
+                    Console.WriteLine($"FreeBytes: {st.FreeBytes}");
+                    Console.WriteLine($"PeakUsedBytes: {st.PeakUsedBytes}");
+                    Console.WriteLine($"AllocCount: {st.AllocCount}");
+                    return;
+                }
+
+                if (Eq(args[1], "reset"))
+                {
+                    MemoryManager.Reset();
+                    Console.WriteLine("OK");
+                    return;
+                }
+
+                Console.WriteLine("Usage: driver mem [status|reset]");
+                return;
+            }
+
             PrintUsage();
         }
 
@@ -148,6 +199,8 @@ namespace BAZOS.Api.Commands
             Console.WriteLine("  driver verify <id>");
             Console.WriteLine("  driver enable <id>");
             Console.WriteLine("  driver disable <id>");
+            Console.WriteLine("  driver cache status|clear");
+            Console.WriteLine("  driver mem [status|reset]");
         }
 
         private static bool Eq(string a, string b)

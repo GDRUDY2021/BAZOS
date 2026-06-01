@@ -11,6 +11,11 @@
 
   <!-- Core kernel packages -->
   <ItemGroup>
+    <Compile Remove="BAZPacker\**" />
+    <EmbeddedResource Remove="BAZPacker\**" />
+    <None Remove="BAZPacker\**" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Cosmos.Kernel" Version="3.0.58" />
     <PackageReference Include="Cosmos.Kernel.System" Version="3.0.58" />
   </ItemGroup>

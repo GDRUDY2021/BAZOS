@@ -1,4 +1,5 @@
 using BAZOS.Drivers;
+using BAZOS.FS;
 using System;
 using System.Linq;
 
@@ -13,6 +14,12 @@ namespace BAZOS.Api.Commands
         public void Execute(Shell.CommandContext ctx)
         {
             var args = ctx.Args ?? Array.Empty<string>();
+            var diskOpt = ctx.GetOption("disk");
+            if (!string.IsNullOrWhiteSpace(diskOpt))
+            {
+                HandleDiskMode(diskOpt!, ctx);
+                return;
+            }
             if (args.Length == 0)
             {
                 PrintUsage();
@@ -130,6 +137,94 @@ namespace BAZOS.Api.Commands
             PrintUsage();
         }
 
+        private static void HandleDiskMode(string slotText, Shell.CommandContext ctx)
+        {
+            int slot = ParseDiskSlot(slotText);
+            if (slot < 0)
+            {
+                Console.WriteLine("device: invalid disk slot (use 0, 1, or current).");
+                return;
+            }
+
+            bool doFormat = ctx.HasOption("f");
+            bool doMount = ctx.HasOption("m");
+            string getOpt = ctx.GetOption("get");
+
+            if (!doFormat && !doMount && string.IsNullOrEmpty(getOpt))
+            {
+                Console.WriteLine("Usage: device /disk=<slot> [/f] [/m] [/get=size|blocks|blocksize|status|magic|all]");
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(getOpt))
+            {
+                var drive = AtaManager.GetDrive(slot);
+                if (drive == null)
+                {
+                    Console.WriteLine("error: disk empty");
+                }
+                else
+                {
+                    ulong blockCount = drive.BlockCount;
+                    ulong blockSize = drive.BlockSize;
+                    ulong sizeMb = (blockCount * blockSize) / (1024 * 1024);
+                    bool isMounted = (BAZOS.FS.BazFs.ActiveDiskSlot == slot && BAZOS.FS.BazFs.IsMounted);
+
+                    switch (getOpt.ToLowerInvariant())
+                    {
+                        case "size":
+                            Console.WriteLine(sizeMb); // Выводит только число
+                            break;
+                        case "blocks":
+                            Console.WriteLine(blockCount);
+                            break;
+                        case "blocksize":
+                            Console.WriteLine(blockSize);
+                            break;
+                        case "status":
+                            Console.WriteLine(isMounted ? "mounted" : "unmounted");
+                            break;
+                        case "magic":
+                            Console.WriteLine(isMounted ? $"0x{BAZOS.FS.BazFs.Superblock.Magic:X8}" : "none");
+                            break;
+                        case "all":
+                            Console.WriteLine($"Drive Type: ATA");
+                            Console.WriteLine($"Total Blocks: {blockCount}");
+                            Console.WriteLine($"Block Size: {blockSize} bytes");
+                            Console.WriteLine($"Total Size: {sizeMb} MB");
+                            Console.WriteLine($"Status: {(isMounted ? "Mounted" : "Not Mounted")}");
+                            if (isMounted)
+                            {
+                                Console.WriteLine($"Magic: 0x{BAZOS.FS.BazFs.Superblock.Magic:X8}");
+                                Console.WriteLine($"Root LBA: {BAZOS.FS.BazFs.Superblock.RootDirLba}");
+                            }
+                            break;
+                        default:
+                            Console.WriteLine("error: unknown property");
+                            break;
+                    }
+                }
+            }
+
+            if (doFormat) Shell.DiskFormat(slot);
+            if (doMount) Shell.DiskMount(slot);
+        }
+
+        private static int ParseDiskSlot(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return -1;
+            text = text.Trim();
+
+            if (text.Equals("current", StringComparison.OrdinalIgnoreCase))
+                return BAZOS.FS.BazFs.ActiveDiskSlot;
+
+            if (int.TryParse(text, out int slot) && (slot == 0 || slot == 1))
+                return slot;
+
+            return -1;
+        }
+
         private static void HandleDeviceSugar(string type, string[] args)
         {
             if (args.Length < 3)
@@ -176,6 +271,9 @@ namespace BAZOS.Api.Commands
             Console.WriteLine("  device disable <id|name>");
             Console.WriteLine("  device status <id|name>");
             Console.WriteLine("  device config <id|name> <key> <value>");
+            Console.WriteLine("  device /disk=0 /m");
+            Console.WriteLine("  device /disk=0 /f");
+            Console.WriteLine("  device /disk=current /f /m");
             Console.WriteLine("  device mouse <key> <value>");
             Console.WriteLine("  device keyboard <key> <value>");
             Console.WriteLine("  device audio <key> <value>");

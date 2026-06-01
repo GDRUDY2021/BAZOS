@@ -1,15 +1,13 @@
 using BAZOS.Drivers;
 using BAZOS.FS;
 using Cosmos.Kernel.Core.X64.Power;
-using Cosmos.Kernel.System;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using static System.Net.WebRequestMethods;
 using BAZOS.Api.Commands;
+using BAZOS.Api.Editor;
 using System.Text;
-using BAZOS.Drivers;
 
 namespace BAZOS.Api
 {
@@ -36,75 +34,41 @@ namespace BAZOS.Api
 
             public void Register(ICommand command)
             {
-                if (command == null)
-                    return;
-
+                if (command == null) return;
                 RegisterName(command.Name, command);
-
                 var aliases = command.Aliases ?? Array.Empty<string>();
-                for (int i = 0; i < aliases.Length; i++)
-                    RegisterName(aliases[i], command);
+                for (int i = 0; i < aliases.Length; i++) RegisterName(aliases[i], command);
             }
 
             private void RegisterName(string name, ICommand command)
             {
-                if (string.IsNullOrWhiteSpace(name))
-                    return;
-
-                _byName[name.Trim()] = command;
+                if (!string.IsNullOrWhiteSpace(name)) _byName[name.Trim()] = command;
             }
 
-            public bool TryGet(string name, out ICommand command)
-                => _byName.TryGetValue(name, out command);
+            public bool TryGet(string name, out ICommand command) => _byName.TryGetValue(name, out command);
 
             public bool Disable(string nameOrAlias)
             {
-                if (string.IsNullOrWhiteSpace(nameOrAlias))
-                    return false;
-
-                if (!_byName.TryGetValue(nameOrAlias.Trim(), out var cmd))
-                    return false;
-
-                var keys = new List<string>();
-                foreach (var kv in _byName)
-                {
-                    if (ReferenceEquals(kv.Value, cmd))
-                        keys.Add(kv.Key);
-                }
-
-                for (int i = 0; i < keys.Count; i++)
-                    _byName.Remove(keys[i]);
-
+                if (string.IsNullOrWhiteSpace(nameOrAlias) || !_byName.TryGetValue(nameOrAlias.Trim(), out var cmd)) return false;
+                var keys = _byName.Where(kv => ReferenceEquals(kv.Value, cmd)).Select(kv => kv.Key).ToList();
+                foreach (var k in keys) _byName.Remove(k);
                 return true;
             }
 
-            public IEnumerable<ICommand> AllUnique()
-            {
-                var seen = new HashSet<ICommand>();
-                foreach (var kv in _byName)
-                {
-                    if (seen.Add(kv.Value))
-                        yield return kv.Value;
-                }
-            }
+            public IEnumerable<ICommand> AllUnique() => _byName.Values.Distinct();
         }
 
         private sealed class DelegateCommand : ICommand
         {
             private readonly Action<CommandContext> _action;
-
             public string Name { get; }
             public string[] Aliases { get; }
             public string? Help { get; }
 
             public DelegateCommand(string name, Action<CommandContext> action, string? help = null, params string[] aliases)
             {
-                Name = name;
-                _action = action;
-                Help = help;
-                Aliases = aliases ?? Array.Empty<string>();
+                Name = name; _action = action; Help = help; Aliases = aliases ?? Array.Empty<string>();
             }
-
             public void Execute(CommandContext ctx) => _action(ctx);
         }
 
@@ -116,61 +80,37 @@ namespace BAZOS.Api
 
             public CommandContext(string command, string[] args, Dictionary<string, string?> options)
             {
-                Command = command;
-                Args = args;
-                Options = options;
+                Command = command; Args = args; Options = options;
             }
 
-            public bool HasOption(string name)
-                => Options.ContainsKey(name);
-
-            public string? GetOption(string name)
-                => Options.TryGetValue(name, out var v) ? v : null;
+            public bool HasOption(string name) => Options.ContainsKey(name);
+            public string? GetOption(string name) => Options.TryGetValue(name, out var v) ? v : null;
         }
 
         private static readonly CommandRegistry Commands = new();
         private static readonly X64PowerOps p = new X64PowerOps();
         private static readonly DriverManager DriverManager = new DriverManager();
+        private static readonly HashSet<string> RecoveryCommands = new(StringComparer.OrdinalIgnoreCase) { "device", "driver", "power", "disk" };
 
         public static void Init()
         {
-            DeviceManager.RegisterDevice(new DeviceDescriptor
-            {
-                Id = "mouse0",
-                Type = DeviceType.Mouse,
-                Name = "Virtual Mouse",
-                Enabled = true
-            });
-            DeviceManager.RegisterDevice(new DeviceDescriptor
-            {
-                Id = "kbd0",
-                Type = DeviceType.Keyboard,
-                Name = "Keyboard",
-                Enabled = true
-            });
-            DeviceManager.RegisterDevice(new DeviceDescriptor
-            {
-                Id = "audio0",
-                Type = DeviceType.Audio,
-                Name = "Audio",
-                Enabled = true
-            });
-
             RegisterCommands();
         }
 
         public static void RunCommand(string input)
         {
-            if (string.IsNullOrWhiteSpace(input))
-                return;
-
+            if (string.IsNullOrWhiteSpace(input)) return;
             var tokens = input.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (tokens.Length == 0)
-                return;
+            if (tokens.Length == 0) return;
 
             var cmd = tokens[0];
-            var rawArgs = tokens.Skip(1).ToArray();
+            if (!BazFs.IsMounted && !RecoveryCommands.Contains(cmd))
+            {
+                Console.WriteLine("Recovery mode: only device, driver, power, disk are available.");
+                return;
+            }
 
+            var rawArgs = tokens.Skip(1).ToArray();
             var args = new List<string>();
             var options = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
@@ -178,400 +118,323 @@ namespace BAZOS.Api
             {
                 if (t.StartsWith("/"))
                 {
-                    // убираем '/'
                     var body = t.Substring(1);
-
-                    // ищем разделитель = или :
                     int eq = body.IndexOf('=');
                     int colon = body.IndexOf(':');
+                    int sep = eq >= 0 && colon >= 0 ? Math.Min(eq, colon) : (eq >= 0 ? eq : colon);
 
-                    int sep = eq >= 0 && colon >= 0
-                        ? Math.Min(eq, colon)
-                        : (eq >= 0 ? eq : colon);
-
-                    if (sep < 0)
-                    {
-                        // просто флаг: /x
-                        var key = body;
-                        if (!string.IsNullOrEmpty(key))
-                            options[key] = null;
-                    }
+                    if (sep < 0) { if (!string.IsNullOrEmpty(body)) options[body] = null; }
                     else
                     {
                         var key = body.Substring(0, sep);
                         var val = body.Substring(sep + 1);
-                        if (!string.IsNullOrEmpty(key))
-                            options[key] = val;
+                        if (!string.IsNullOrEmpty(key)) options[key] = val;
                     }
                 }
-                else
-                {
-                    args.Add(t);
-                }
+                else { args.Add(t); }
             }
 
             if (Commands.TryGet(cmd, out var command))
             {
-                try
-                {
-                    var ctx = new CommandContext(cmd, args.ToArray(), options);
-                    command.Execute(ctx);
-                }
+                try { command.Execute(new CommandContext(cmd, args.ToArray(), options)); }
                 catch (Exception ex)
                 {
-                    if (ex is KernelPanicException)
-                        throw;
+                    if (ex is KernelPanicException) throw;
                     Console.WriteLine($"Error: {ex.Message}");
                 }
             }
             else
             {
-                Console.WriteLine($"\"{cmd}\" is not a command.");
+                // СТРОГИЙ ПОИСК ИСПОЛНЯЕМОГО ФАЙЛА НА ДИСКЕ
+                if (!TryRunExecutable(cmd))
+                {
+                    Console.WriteLine($"\"{cmd}\" is not an internal command or valid executable.");
+                }
             }
+        }
+
+        private static bool TryRunExecutable(string cmd)
+        {
+            if (!BazFs.IsMounted) return false;
+
+            if (!cmd.EndsWith(".bvx", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            string targetFile = cmd;
+
+            if (!BazFs.TryReadFileBytes(targetFile, out byte[] fileData))
+            {
+                string sysPath = "/system/drivers/" + targetFile;
+                if (!BazFs.TryReadFileBytes(sysPath, out fileData))
+                    return false;
+
+                targetFile = sysPath;
+            }
+
+            if (!Runtime.VmModule.TryLoad(fileData, out var module, out string error))
+            {
+                Console.WriteLine($"[bvx] Failed to load '{targetFile}': {error}");
+                return true;
+            }
+
+            string procName = targetFile.Contains('/') ? targetFile.Substring(targetFile.LastIndexOf('/') + 1) : targetFile;
+
+            // --- Очищаем экран, создавая эффект "отдельного окна" ---
+            Console.Clear();
+            Console.BackgroundColor = ConsoleColor.DarkBlue;
+            Console.ForegroundColor = ConsoleColor.White;
+            Console.WriteLine($" BAZOS VM: Running {procName} ".PadRight(Console.WindowWidth));
+            Console.BackgroundColor = ConsoleColor.Black;
+            Console.ForegroundColor = ConsoleColor.Gray;
+
+            int pid = Core.Scheduler.StartProcess(procName, module);
+            var proc = Core.Scheduler.GetProcess(pid); // Получаем ссылку на процесс
+
+            // Модально ждем завершения программы
+            while (proc != null && !proc.IsFinished)
+            {
+                Core.Scheduler.Tick();
+            }
+
+            // Если программа упала - выводим красивую красную полосу
+            if (proc != null && !string.IsNullOrEmpty(proc.ErrorMessage))
+            {
+                Console.WriteLine();
+                Console.BackgroundColor = ConsoleColor.DarkRed;
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.WriteLine($" [VM CRASH] {proc.ErrorMessage} ".PadRight(Console.WindowWidth));
+            }
+            else
+            {
+                //Console.WriteLine();
+                //Console.BackgroundColor = ConsoleColor.DarkGreen;
+                //Console.ForegroundColor = ConsoleColor.White;
+                //Console.WriteLine($" [VM EXITED] Program finished normally. ".PadRight(Console.WindowWidth));
+            }
+
+            Console.BackgroundColor = ConsoleColor.Black;
+            Console.ForegroundColor = ConsoleColor.Gray;
+            Console.WriteLine("\nPress any key to return to Shell...");
+
+            // Ждем нажатия любой кнопки
+            Drivers.InputBus.ReadKey();
+
+            // --- "Восстанавливаем" Shell ---
+            Console.Clear();
+            Console.WriteLine("BAZOS Shell restored.");
+            return true;
         }
 
         private static void RegisterCommands()
         {
             Commands.Clear();
-
             Commands.Register(new DelegateCommand("help", Help, "Show help"));
             Commands.Register(new DelegateCommand("cls", _ => Console.Clear(), "Clear screen", aliases: new[] { "clear" }));
             Commands.Register(new DelegateCommand("halt", Halt, "Halt the system"));
-
             Commands.Register(new DelegateCommand("dir", ListDirectory, "List current directory"));
             Commands.Register(new DelegateCommand("cd", ChangeDirectory, "Change directory"));
-            Commands.Register(new DelegateCommand("mkdir", CreateDirectory, "Create directory"));
-            Commands.Register(new DelegateCommand("rmdir", RemoveDirectory, "Remove directory"));
-            Commands.Register(new DelegateCommand("del", DeleteFile, "Delete file"));
             Commands.Register(new DelegateCommand("copy", CopyFile, "Copy file"));
             Commands.Register(new DelegateCommand("type", TypeFile, "Print file contents"));
-
             Commands.Register(new DelegateCommand("panic", _ => Panic(), "Kernel panic (crash)"));
-
-            Commands.Register(new DelegateCommand("mkfs", Mkfs, "Format BAZFS"));
-            Commands.Register(new DelegateCommand("mount", MountFs, "Mount BAZFS"));
             Commands.Register(new DelegateCommand("dumpfs", DumpFs, "Dump raw FS sector"));
             Commands.Register(new DelegateCommand("fsck", _ => BazFs.FsckLite(), "Check BAZFS (fsck-lite)"));
             Commands.Register(new DelegateCommand("dirfs", DirFs, "List BAZFS root"));
-            Commands.Register(new DelegateCommand("mkfile", MkFile, "Create file with data"));
             Commands.Register(new DelegateCommand("catfs", CatFs, "Read file (legacy)"));
             Commands.Register(new DelegateCommand("check", CheckEntry, "Check file/dir exists"));
-
+            Commands.Register(new DelegateCommand("change", ChangeFile, "Open text editor"));
             Commands.Register(new DelegateCommand("power", Power, "Power control"));
+            Commands.Register(new DelegateCommand("say", Say, "Print text to console. Use /n for no newline."));
+            Commands.Register(new DelegateCommand("pack", InstallFs, "-"));
+
+            Commands.Register(new DelegateCommand("ide", ctx => Ide.Run(ctx.Args.Length > 0 ? ctx.Args[0] : ""), "Open Console IDE"));
 
             Commands.Register(new DeviceCommand());
             Commands.Register(new DriverCommand(DriverManager));
+            Commands.Register(new FsCommand());
+            Commands.Register(new GroupCommand());
+        }
+
+        private static void Say(CommandContext ctx)
+        {
+            string message = string.Join(" ", ctx.Args);
+
+            if (ctx.HasOption("n"))
+            {
+                Console.Write(message);
+            }
+            else
+            {
+                Console.WriteLine(message);
+            }
+        }
+
+        public static bool DiskFormat(int slot)
+        {
+            if (!BazFs.SetActiveDiskSlot(slot)) { Console.WriteLine("disk: invalid slot."); return false; }
+            Console.WriteLine($"Formatting BAZFS on disk slot {slot}...");
+            bool ok = BazFs.Format();
+            Console.WriteLine(ok ? "mkfs: done." : "mkfs: failed.");
+            InputBus.SetRescueConsoleFallback(!BazFs.IsMounted);
+            return ok;
+        }
+
+        public static bool DiskMount(int slot)
+        {
+            if (!BazFs.SetActiveDiskSlot(slot)) { Console.WriteLine("disk: invalid slot."); return false; }
+            Console.WriteLine($"Mounting BAZFS on disk slot {slot}...");
+            if (!BazFs.Mount())
+            {
+                InputBus.SetRescueConsoleFallback(true);
+                Console.WriteLine("mount: failed.");
+                return false;
+            }
+
+            InputBus.SetRescueConsoleFallback(true);
+            var sb = BazFs.Superblock;
+            Console.WriteLine("mount: OK");
+            Console.WriteLine($"  Magic   = 0x{sb.Magic:X8}");
+            Console.WriteLine($"  RootLBA = {sb.RootDirLba}");
+
+            DeviceManager.LoadConfig();
+            DriverManager.Reload();
+            DriverManager.ApplyEnabled();
+
+            for (int i = 0; i < 50; i++)
+            {
+                Core.Scheduler.Tick();
+            }
+
+            if (InputBus.IsKeyboardEnabled)
+            {
+                Console.WriteLine("[recovery] User-space keyboard driver active.");
+                InputBus.SetRescueConsoleFallback(false);
+            }
+            else
+            {
+                Console.WriteLine("[recovery] kbd driver not active, using cosmos rescue keyboard");
+                InputBus.SetRescueConsoleFallback(true);
+            }
+
+            return true;
         }
 
         private static void DumpFs(CommandContext ctx)
         {
-            Console.WriteLine("Reading sector 0 via ATA...");
-
+            int slot = BazFs.ActiveDiskSlot;
+            var drive = AtaManager.GetDrive(slot);
+            if (drive == null) { Console.WriteLine($"dumpfs: Disk slot {slot} not available."); return; }
+            Console.WriteLine($"Reading sector 0 via ATA (Slot {slot})...");
             Span<byte> buffer = stackalloc byte[512];
-            if (AtaDisk.ReadSector(0, buffer))
+            if (drive.ReadSector(0, buffer))
             {
                 Console.WriteLine("Sector 0 read OK. First bytes:");
-                for (int i = 0; i < 512; i++)
-                    Console.Write($"{buffer[i]:X2} ");
+                for (int i = 0; i < 512; i++) Console.Write($"{buffer[i]:X2} ");
                 Console.WriteLine();
             }
-            else
-            {
-                Console.WriteLine("Failed to read sector 0.");
-            }
+            else { Console.WriteLine("Failed to read sector 0."); }
         }
 
-        private static void DirFs(CommandContext ctx)
-        {
-            BazFs.ListRoot();
-        }
-
-        private static void MkFile(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: mkfile <path> [data...] [/b] [/o]");
-                return;
-            }
-
-            string path = args[0];
-            bool binary = ctx.HasOption("b");
-            bool overwrite = ctx.HasOption("o");
-
-            var dataArgs = args.Skip(1).ToArray();
-
-            byte[] bytes;
-
-            if (binary)
-            {
-                // mkfile f 41 42 43 /b -> [0x41, 0x42, 0x43]
-                if (dataArgs.Length == 0)
-                {
-                    bytes = Array.Empty<byte>();
-                }
-                else
-                {
-                    var list = new List<byte>();
-
-                    foreach (var token in dataArgs)
-                    {
-                        // допускаем "41", "0x41", "ff" и т.п.
-                        string t = token.Trim();
-
-                        if (t.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-                            t = t.Substring(2);
-
-                        if (t.Length == 0)
-                            continue;
-
-                        if (t.Length > 2)
-                        {
-                            Console.WriteLine($"Invalid byte '{token}', use 00..FF.");
-                            return;
-                        }
-
-                        if (!byte.TryParse(t, System.Globalization.NumberStyles.HexNumber,  System.Globalization.CultureInfo.InvariantCulture, out byte value))
-                        {
-                            Console.WriteLine($"Invalid byte '{token}', use hex 00..FF.");
-                            return;
-                        }
-
-                        list.Add(value);
-                    }
-
-                    bytes = list.ToArray();
-                }
-            }
-            else
-            {
-                string content = dataArgs.Length > 0
-                    ? string.Join(' ', dataArgs)
-                    : string.Empty;
-
-                bytes = System.Text.Encoding.ASCII.GetBytes(content);
-            }
-
-            BazFs.CreateFileWithPath(path, bytes, overwrite);
-        }
-
-        private static void CatFs(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: catfs <name>");
-                return;
-            }
-
-            BazFs.ReadFileFromCurrentDir(args[0]);
-        }
-
-        private static void ThrowTestException()
-        {
-            throw new KernelPanicException("Test exception (panic-ex)");
-        }
-
-        private static void Panic()
-        {
-            throw new KernelPanicException("Kernel panic requested");
-        }
-
+        private static void DirFs(CommandContext ctx) => BazFs.ListRoot();
+        private static void CatFs(CommandContext ctx) { if (ctx.Args.Length > 0) BazFs.ReadFileFromCurrentDir(ctx.Args[0]); }
+        private static void Panic() => throw new KernelPanicException("Kernel panic requested");
         public static event Action? HaltRequested;
 
         private static void Help(CommandContext ctx)
         {
             Console.WriteLine("Available commands:");
             foreach (var c in Commands.AllUnique().OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
-            {
-                string aliases = (c.Aliases != null && c.Aliases.Length > 0)
-                    ? $" (aliases: {string.Join(", ", c.Aliases)})"
-                    : string.Empty;
-                string help = string.IsNullOrWhiteSpace(c.Help) ? string.Empty : $" - {c.Help}";
-                Console.WriteLine($"  {c.Name}{aliases}{help}");
-            }
-            Console.WriteLine("options syntax: /name or /name=value");
+                Console.WriteLine($"  {c.Name}");
         }
 
-        private static void Halt(CommandContext ctx)
-        {
-            Console.WriteLine("Halting system...");
-            HaltRequested?.Invoke();
-        }
-
-        private static void Mkfs(CommandContext ctx)
-        {
-            Console.WriteLine("Formatting BAZFS on disk...");
-            if (BazFs.Format())
-                Console.WriteLine("mkfs: done.");
-            else
-                Console.WriteLine("mkfs: failed.");
-        }
-
-        private static void MountFs(CommandContext ctx)
-        {
-            Console.WriteLine("Mounting BAZFS...");
-            if (BazFs.Mount())
-            {
-                var sb = BazFs.Superblock;
-                Console.WriteLine("mount: OK");
-                Console.WriteLine($"  Magic   = 0x{sb.Magic:X8}");
-                Console.WriteLine($"  Version = {sb.Version}");
-                Console.WriteLine($"  RootLBA = {sb.RootDirLba}");
-                Console.WriteLine($"  Blocks  = {sb.TotalBlocks}");
-
-                DeviceManager.LoadConfig();
-                ModuleLoader.Apply(Commands);
-
-                DriverManager.Reload();
-                DriverManager.ApplyEnabled();
-            }
-            else
-            {
-                Console.WriteLine("mount: failed.");
-            }
-        }
-
-        private static void ListDirectory(CommandContext ctx)
-        {
-            BazFs.ListDirectory();
-        }
-
-        private static void ChangeDirectory(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: cd <name> or cd /");
-                return;
-            }
-
-            BazFs.ChangeDirectory(args[0]);
-        }
-
-        private static void CreateDirectory(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: mkdir <name>");
-                return;
-            }
-
-            BazFs.CreateDirectory(args[0]);
-        }
-
-        private static void RemoveDirectory(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: rmdir <name> [/f]");
-                return;
-            }
-
-            bool force = ctx.HasOption("f");
-            BazFs.RemoveDirectory(args[0], force);
-        }
-
-        private static void DeleteFile(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: del <name>");
-                return;
-            }
-
-            BazFs.DeleteFile(args[0]);
-        }
-
-        private static void CopyFile(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length < 2)
-            {
-                Console.WriteLine("Usage: copy <src> <dst> [/overwrite]");
-                return;
-            }
-
-            bool overwrite = ctx.HasOption("overwrite");
-            BazFs.CopyFile(args[0], args[1], overwrite);
-        }
-
-        private static void TypeFile(CommandContext ctx)
-        {
-            var args = ctx.Args;
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: type <name>");
-                return;
-            }
-
-            BazFs.ReadFileFromCurrentDir(args[0]);
-        }
-
-        private static string ResolvePath(string path)
-        {
-            return path;
-        }
-
-        private static string NormalizeDir(string dir)
-        {
-            return dir;
-        }
+        private static void Halt(CommandContext ctx) { Console.WriteLine("Halting system..."); HaltRequested?.Invoke(); }
+        private static void ListDirectory(CommandContext ctx) => BazFs.ListDirectory();
+        private static void ChangeDirectory(CommandContext ctx) { if (ctx.Args.Length > 0) BazFs.ChangeDirectory(ctx.Args[0]); }
+        private static void CreateDirectory(CommandContext ctx) { if (ctx.Args.Length > 0) BazFs.CreateDirectory(ctx.Args[0]); }
+        private static void RemoveDirectory(CommandContext ctx) { if (ctx.Args.Length > 0) BazFs.RemoveDirectory(ctx.Args[0], ctx.HasOption("f")); }
+        private static void DeleteFile(CommandContext ctx) { if (ctx.Args.Length > 0) BazFs.DeleteFile(ctx.Args[0]); }
+        private static void CopyFile(CommandContext ctx) { if (ctx.Args.Length > 1) BazFs.CopyFile(ctx.Args[0], ctx.Args[1], ctx.HasOption("overwrite")); }
+        private static void TypeFile(CommandContext ctx) { if (ctx.Args.Length > 0) BazFs.ReadFileFromCurrentDir(ctx.Args[0]); }
+        private static void ChangeFile(CommandContext ctx) { if (ctx.Args.Length > 0) TextEditor.Run(ctx.Args[0]); }
 
         private static void CheckEntry(CommandContext ctx)
         {
-            var args = ctx.Args;
-
-            if (args.Length == 0)
-            {
-                Console.WriteLine("Usage: check <name> /f | /d");
-                return;
-            }
-
-            string name = args[0];
-            bool isFile = ctx.HasOption("f");
-            bool isDir = ctx.HasOption("d");
-
-            if (isFile == isDir)
-            {
-                Console.WriteLine("Usage: check <name> /f | /d");
-                return;
-            }
-
-            bool result;
-            if (isFile)
-                result = BazFs.FileExistsInCurrentDir(name);
-            else
-                result = BazFs.DirectoryExistsInCurrentDir(name);
-
-            Console.WriteLine(result ? "true" : "false");
+            if (ctx.Args.Length == 0) return;
+            string name = ctx.Args[0];
+            bool isFile = ctx.HasOption("f"), isDir = ctx.HasOption("d");
+            if (isFile == isDir) return;
+            Console.WriteLine((isFile ? BazFs.FileExistsInCurrentDir(name) : BazFs.DirectoryExistsInCurrentDir(name)) ? "true" : "false");
         }
 
         private static void Power(CommandContext ctx)
         {
-            bool rb = ctx.HasOption("rb");
-            bool off = ctx.HasOption("off");
-            int count = (rb ? 1 : 0) + (off ? 1 : 0);
+            if (ctx.HasOption("rb")) { Console.WriteLine("Rebooting..."); p.Reboot(); }
+            else if (ctx.HasOption("off")) { Console.WriteLine("Powering off..."); p.Shutdown(); }
+        }
 
-            if (count != 1)
+        private static void InstallFs(CommandContext ctx)
+        {
+            if (!BazFs.IsMounted)
             {
-                Console.WriteLine("Usage: power /rb | /off");
+                Console.WriteLine("Error: Mount the BAZFS disk first! (device /disk=0 /m)");
                 return;
             }
 
-            if (rb)
+            Console.WriteLine("Reading built-in Initrd payload from kernel memory...");
+
+            byte[] archive = Core.InitrdPayload.Data;
+
+            if (archive == null || archive.Length < 8)
             {
-                Console.WriteLine("Rebooting...");
-                p.Reboot();
+                Console.WriteLine("Error: InitrdPayload.Data is missing or empty.");
+                return;
             }
-            else
+
+            // Проверяем подпись "PACK"
+            string magic = Encoding.ASCII.GetString(archive, 0, 4);
+            if (magic != "PACK")
             {
-                Console.WriteLine("Powering off...");
-                p.Shutdown();
+                Console.WriteLine($"Error: Invalid archive magic: {magic}");
+                return;
             }
+
+            int fileCount = BitConverter.ToInt32(archive, 4);
+            Console.WriteLine($"Found {fileCount} files in initrd. Extracting to BAZFS...");
+
+            int pos = 8;
+            for (int i = 0; i < fileCount; i++)
+            {
+                if (pos >= archive.Length) break;
+
+                // Читаем длину пути и путь
+                int pathLen = BitConverter.ToInt32(archive, pos);
+                pos += 4;
+                string path = Encoding.UTF8.GetString(archive, pos, pathLen);
+                pos += pathLen;
+
+                // Читаем размер файла
+                int dataLen = BitConverter.ToInt32(archive, pos);
+                pos += 4;
+
+                // Извлекаем директорию и создаем её в BazFs
+                int lastSlash = path.LastIndexOf('/');
+                if (lastSlash > 0)
+                {
+                    string dir = path.Substring(0, lastSlash);
+                    BazFs.CreateDirectory(dir);
+                }
+
+                // Вырезаем байты файла
+                byte[] fileData = new byte[dataLen];
+                Array.Copy(archive, pos, fileData, 0, dataLen);
+
+                // Пишем на жесткий диск BAZFS
+                BazFs.CreateFileWithPath(path, fileData, overwrite: true);
+                Console.WriteLine($" Extracted: {path}");
+
+                pos += dataLen;
+            }
+
+            Console.WriteLine("Installation complete! The BAZOS file system is ready.");
         }
     }
 }
